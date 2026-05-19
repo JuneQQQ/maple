@@ -19,7 +19,7 @@ export function Sidebar() {
     <aside className="sidebar">
       <button className="new-chat-btn" onClick={newConversation}>
         <Plus size={16} />
-        <span>New chat</span>
+        <span>New session</span>
       </button>
 
       <nav className="conv-list">

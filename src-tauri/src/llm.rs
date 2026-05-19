@@ -53,6 +53,8 @@ pub enum StreamEvent {
     Started { model: String },
     /// Provider responded; the stream is open.
     Connected,
+    /// A raw SSE `data:` payload, exactly as received (for the inspector).
+    RawFrame { at_ms: u64, data: String },
     /// A chunk of reasoning / "thinking" text.
     Reasoning { delta: String },
     /// A chunk of answer text.
@@ -270,6 +272,10 @@ impl LlmClient {
                 if payload.is_empty() {
                     continue;
                 }
+                on_event(StreamEvent::RawFrame {
+                    at_ms: started.elapsed().as_millis() as u64,
+                    data: payload.to_string(),
+                });
                 if payload == "[DONE]" {
                     done = true;
                     break;

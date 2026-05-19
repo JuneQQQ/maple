@@ -1,8 +1,9 @@
-// Central application state (Zustand).
+// Central application state (Zustand) for the glass-box model.
 //
-// Performance note: streamed token deltas are coalesced with
-// requestAnimationFrame so React re-renders at most once per frame, no matter
-// how fast the provider streams.
+// A send creates a turn, then streams one *run* per selected model — N models
+// run concurrently (racing). Token deltas from every run are coalesced into a
+// single requestAnimationFrame flush, so React re-renders at most once a frame
+// no matter how many models stream at once.
 
 import { create } from "zustand";
 import { api } from "../lib/api";
@@ -10,43 +11,15 @@ import { titleFrom } from "../lib/format";
 import type {
   Conversation,
   Metrics,
+  RawFrame,
+  Run,
+  RunView,
   Settings,
-  StoredMessage,
   StreamEvent,
+  Turn,
+  TurnView,
+  TurnWithRuns,
 } from "../lib/types";
-
-export type TurnStatus =
-  | "starting"
-  | "connected"
-  | "streaming"
-  | "done"
-  | "error";
-
-export interface TimelineEvent {
-  /** ms since the turn started */
-  t: number;
-  label: string;
-  tone: "info" | "good" | "warn" | "bad";
-}
-
-export interface ToolCallView {
-  id: string;
-  name: string;
-  arguments: string;
-}
-
-/** The in-flight assistant turn. Null when idle. */
-export interface StreamingTurn {
-  status: TurnStatus;
-  model: string;
-  content: string;
-  reasoning: string;
-  toolCalls: ToolCallView[];
-  timeline: TimelineEvent[];
-  metrics: Metrics;
-  startedAt: number;
-  error: string | null;
-}
 
 const DEFAULT_SETTINGS: Settings = {
   base_url: "",
@@ -58,16 +31,16 @@ const DEFAULT_SETTINGS: Settings = {
 interface AppState {
   ready: boolean;
   view: "chat" | "settings";
+  sidebarCollapsed: boolean;
   conversations: Conversation[];
   currentId: string | null;
-  messages: StoredMessage[];
-  streaming: StreamingTurn | null;
+  turns: TurnView[];
+  racing: boolean;
   settings: Settings;
   models: string[];
   modelsError: string | null;
   loadingModels: boolean;
-  selectedModel: string;
-  sidebarCollapsed: boolean;
+  selectedModels: string[];
 
   init: () => Promise<void>;
   setView: (v: "chat" | "settings") => void;
@@ -76,42 +49,86 @@ interface AppState {
   newConversation: () => void;
   deleteConversation: (id: string) => Promise<void>;
   renameConversation: (id: string, title: string) => Promise<void>;
-  setModel: (m: string) => void;
+  toggleModel: (m: string) => void;
+  setSelectedModels: (m: string[]) => void;
   refreshModels: () => Promise<void>;
   saveSettings: (s: Settings) => Promise<void>;
-  sendMessage: (text: string) => Promise<void>;
+  send: (prompt: string) => Promise<void>;
 }
 
 function applyTheme(theme: string) {
   document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
 }
 
-function bumpConversation(list: Conversation[], id: string): Conversation[] {
-  const idx = list.findIndex((c) => c.id === id);
-  if (idx < 0) return list;
-  const updated = { ...list[idx], updated_at: Date.now() };
-  return [updated, ...list.slice(0, idx), ...list.slice(idx + 1)];
+function bump(list: Conversation[], id: string): Conversation[] {
+  const i = list.findIndex((c) => c.id === id);
+  if (i < 0) return list;
+  const updated = { ...list[i], updated_at: Date.now() };
+  return [updated, ...list.slice(0, i), ...list.slice(i + 1)];
+}
+
+function runToView(run: Run): RunView {
+  let metrics: Metrics = {};
+  let rawFrames: RawFrame[] = [];
+  try {
+    if (run.metrics) metrics = JSON.parse(run.metrics) as Metrics;
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (run.raw) rawFrames = JSON.parse(run.raw) as RawFrame[];
+  } catch {
+    /* ignore */
+  }
+  return {
+    id: run.id,
+    model: run.model,
+    status: run.status === "error" ? "error" : "done",
+    content: run.content,
+    reasoning: run.reasoning ?? "",
+    metrics,
+    rawFrames,
+    finishReason: run.finish_reason,
+    error: run.error,
+    startedAt: null,
+    connectedAt: null,
+    firstTokenAt: null,
+    doneAt: null,
+    rateSamples: [],
+  };
+}
+
+function toTurnView(tw: TurnWithRuns): TurnView {
+  return {
+    id: tw.turn.id,
+    prompt: tw.turn.prompt,
+    created_at: tw.turn.created_at,
+    runs: tw.runs.map(runToView),
+  };
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
   view: "chat",
+  sidebarCollapsed: false,
   conversations: [],
   currentId: null,
-  messages: [],
-  streaming: null,
+  turns: [],
+  racing: false,
   settings: DEFAULT_SETTINGS,
   models: [],
   modelsError: null,
   loadingModels: false,
-  selectedModel: "",
-  sidebarCollapsed: false,
+  selectedModels: [],
 
   init: async () => {
     try {
       const settings = await api.getSettings();
       applyTheme(settings.theme);
-      set({ settings, selectedModel: settings.default_model });
+      set({
+        settings,
+        selectedModels: settings.default_model ? [settings.default_model] : [],
+      });
     } catch (e) {
       console.error("load settings failed", e);
     }
@@ -125,29 +142,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setView: (v) => set({ view: v }),
-
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
 
   selectConversation: async (id) => {
-    set({ currentId: id, view: "chat", messages: [], streaming: null });
-    const conv = get().conversations.find((c) => c.id === id);
-    if (conv?.model) set({ selectedModel: conv.model });
+    set({ currentId: id, view: "chat", turns: [] });
     try {
-      const messages = await api.getMessages(id);
-      if (get().currentId === id) set({ messages });
+      const turns = await api.getTurns(id);
+      if (get().currentId === id) set({ turns: turns.map(toTurnView) });
     } catch (e) {
-      console.error("load messages failed", e);
+      console.error("load turns failed", e);
     }
   },
 
-  newConversation: () =>
-    set({ currentId: null, messages: [], streaming: null, view: "chat" }),
+  newConversation: () => set({ currentId: null, turns: [], view: "chat" }),
 
   deleteConversation: async (id) => {
     try {
       await api.deleteConversation(id);
     } catch (e) {
-      console.error("delete conversation failed", e);
+      console.error("delete failed", e);
       return;
     }
     set((s) => {
@@ -155,8 +168,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         conversations: s.conversations.filter((c) => c.id !== id),
         currentId: wasCurrent ? null : s.currentId,
-        messages: wasCurrent ? [] : s.messages,
-        streaming: wasCurrent ? null : s.streaming,
+        turns: wasCurrent ? [] : s.turns,
       };
     });
   },
@@ -172,11 +184,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         ),
       }));
     } catch (e) {
-      console.error("rename conversation failed", e);
+      console.error("rename failed", e);
     }
   },
 
-  setModel: (m) => set({ selectedModel: m }),
+  toggleModel: (m) =>
+    set((s) => ({
+      selectedModels: s.selectedModels.includes(m)
+        ? s.selectedModels.filter((x) => x !== m)
+        : [...s.selectedModels, m],
+    })),
+
+  setSelectedModels: (m) => set({ selectedModels: m }),
 
   refreshModels: async () => {
     set({ loadingModels: true, modelsError: null });
@@ -192,49 +211,41 @@ export const useAppStore = create<AppState>((set, get) => ({
     applyTheme(next.theme);
     set((s) => ({
       settings: next,
-      selectedModel: s.selectedModel || next.default_model,
+      selectedModels:
+        s.selectedModels.length > 0
+          ? s.selectedModels
+          : next.default_model
+            ? [next.default_model]
+            : [],
     }));
     void get().refreshModels();
   },
 
-  sendMessage: async (rawText) => {
-    const text = rawText.trim();
+  send: async (promptText) => {
+    const text = promptText.trim();
     if (!text) return;
-
     const s0 = get();
-    const busy =
-      s0.streaming != null &&
-      s0.streaming.status !== "done" &&
-      s0.streaming.status !== "error";
-    if (busy) return;
+    if (s0.racing) return;
 
-    const model = s0.selectedModel || s0.settings.default_model;
-    if (!model) {
-      set({
-        streaming: {
-          status: "error",
-          model: "",
-          content: "",
-          reasoning: "",
-          toolCalls: [],
-          timeline: [],
-          metrics: {},
-          startedAt: performance.now(),
-          error: "No model selected — choose one in Settings.",
-        },
-      });
+    const models = (
+      s0.selectedModels.length > 0
+        ? s0.selectedModels
+        : [s0.settings.default_model]
+    ).filter((m) => m.trim().length > 0);
+    if (models.length === 0) {
+      console.error("no model selected");
       return;
     }
 
-    // Create a conversation lazily on the first message.
+    // Ensure a conversation.
     let convId = s0.currentId;
     if (!convId) {
       try {
-        const conv = await api.createConversation(titleFrom(text), model);
+        const conv = await api.createConversation(titleFrom(text));
         set((s) => ({
           conversations: [conv, ...s.conversations],
           currentId: conv.id,
-          messages: [],
+          turns: [],
         }));
         convId = conv.id;
       } catch (e) {
@@ -243,168 +254,184 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
 
-    // Optimistic user message.
-    const tempId = `temp-${Date.now()}`;
+    // Create the turn.
+    let turn: Turn;
+    try {
+      turn = await api.createTurn(convId, text);
+    } catch (e) {
+      console.error("create turn failed", e);
+      return;
+    }
+
+    // Optimistic turn view — one "starting" run per model.
+    const startedAt = performance.now();
+    const runViews: RunView[] = models.map((model, i) => ({
+      id: `live-${turn.id}-${i}`,
+      model,
+      status: "starting",
+      content: "",
+      reasoning: "",
+      metrics: {},
+      rawFrames: [],
+      finishReason: null,
+      error: null,
+      startedAt,
+      connectedAt: null,
+      firstTokenAt: null,
+      doneAt: null,
+      rateSamples: [],
+    }));
     set((s) => ({
-      messages: [
-        ...s.messages,
-        {
-          id: tempId,
-          conversation_id: convId!,
-          role: "user",
-          content: text,
-          reasoning: null,
-          metrics: null,
-          created_at: Date.now(),
-        },
+      racing: true,
+      turns: [
+        ...s.turns,
+        { id: turn.id, prompt: text, created_at: turn.created_at, runs: runViews },
       ],
     }));
 
-    const startedAt = performance.now();
-    set({
-      streaming: {
-        status: "starting",
-        model,
-        content: "",
-        reasoning: "",
-        toolCalls: [],
-        timeline: [{ t: 0, label: "Request sent", tone: "info" }],
-        metrics: {},
-        startedAt,
-        error: null,
-      },
-    });
-
-    // --- render batching: one update per animation frame ---
-    let pendingContent = "";
-    let pendingReasoning = "";
+    // ---- per-frame batching shared across all racing runs ----
+    type Pending = {
+      content: string;
+      reasoning: string;
+      rate: { t: number; n: number }[];
+      raw: RawFrame[];
+    };
+    const pending = new Map<string, Pending>();
     let frame: number | null = null;
+    const ensure = (id: string): Pending => {
+      let p = pending.get(id);
+      if (!p) {
+        p = { content: "", reasoning: "", rate: [], raw: [] };
+        pending.set(id, p);
+      }
+      return p;
+    };
     const flush = () => {
       frame = null;
-      if (!pendingContent && !pendingReasoning) return;
-      const c = pendingContent;
-      const r = pendingReasoning;
-      pendingContent = "";
-      pendingReasoning = "";
-      set((s) =>
-        s.streaming
-          ? {
-              streaming: {
-                ...s.streaming,
-                content: s.streaming.content + c,
-                reasoning: s.streaming.reasoning + r,
+      if (pending.size === 0) return;
+      const snap = new Map(pending);
+      pending.clear();
+      set((s) => ({
+        turns: s.turns.map((t) =>
+          t.id !== turn.id
+            ? t
+            : {
+                ...t,
+                runs: t.runs.map((r) => {
+                  const p = snap.get(r.id);
+                  if (!p) return r;
+                  return {
+                    ...r,
+                    content: r.content + p.content,
+                    reasoning: r.reasoning + p.reasoning,
+                    rateSamples:
+                      p.rate.length > 0
+                        ? [...r.rateSamples, ...p.rate]
+                        : r.rateSamples,
+                    rawFrames:
+                      p.raw.length > 0
+                        ? [...r.rawFrames, ...p.raw]
+                        : r.rawFrames,
+                  };
+                }),
               },
-            }
-          : {},
-      );
+        ),
+      }));
     };
     const schedule = () => {
       if (frame == null) frame = requestAnimationFrame(flush);
     };
+    const patchRun = (runId: string, fn: (r: RunView) => RunView) => {
+      set((s) => ({
+        turns: s.turns.map((t) =>
+          t.id !== turn.id
+            ? t
+            : { ...t, runs: t.runs.map((r) => (r.id === runId ? fn(r) : r)) },
+        ),
+      }));
+    };
 
-    const elapsed = () => Math.round(performance.now() - startedAt);
-    const addTimeline = (label: string, tone: TimelineEvent["tone"]) =>
-      set((s) =>
-        s.streaming
-          ? {
-              streaming: {
-                ...s.streaming,
-                timeline: [
-                  ...s.streaming.timeline,
-                  { t: elapsed(), label, tone },
-                ],
-              },
+    const firstToken = new Set<string>();
+
+    const runOne = async (runId: string, model: string) => {
+      const onEvent = (e: StreamEvent) => {
+        const now = performance.now();
+        switch (e.kind) {
+          case "connected":
+            patchRun(runId, (r) => ({
+              ...r,
+              status: r.status === "starting" ? "connected" : r.status,
+              connectedAt: r.connectedAt ?? now,
+            }));
+            break;
+          case "content":
+          case "reasoning": {
+            if (!firstToken.has(runId)) {
+              firstToken.add(runId);
+              patchRun(runId, (r) => ({
+                ...r,
+                status: "streaming",
+                firstTokenAt: r.firstTokenAt ?? now,
+              }));
             }
-          : {},
-      );
-    const markStreaming = () => {
-      const st = get().streaming;
-      if (st && st.status !== "streaming") {
-        set({ streaming: { ...st, status: "streaming" } });
-        addTimeline("First token", "good");
+            const p = ensure(runId);
+            if (e.kind === "content") {
+              p.content += e.delta;
+              p.rate.push({ t: now - startedAt, n: e.delta.length });
+            } else {
+              p.reasoning += e.delta;
+            }
+            schedule();
+            break;
+          }
+          case "raw_frame":
+            ensure(runId).raw.push({ at_ms: e.at_ms, data: e.data });
+            schedule();
+            break;
+          case "metrics":
+          case "done":
+            patchRun(runId, (r) => ({
+              ...r,
+              metrics: { ...r.metrics, ...e.metrics },
+            }));
+            break;
+          case "error":
+            patchRun(runId, (r) => ({
+              ...r,
+              status: "error",
+              error: e.message,
+            }));
+            break;
+          default:
+            break;
+        }
+      };
+
+      try {
+        const finalRun = await api.sendRun(turn.id, model, onEvent);
+        patchRun(runId, (r) => ({
+          ...r,
+          status: finalRun.status === "error" ? "error" : "done",
+          doneAt: r.doneAt ?? performance.now(),
+          error: finalRun.error ?? r.error,
+          finishReason: finalRun.finish_reason ?? r.finishReason,
+        }));
+      } catch (e) {
+        patchRun(runId, (r) => ({
+          ...r,
+          status: "error",
+          error: r.error ?? String(e),
+          doneAt: r.doneAt ?? performance.now(),
+        }));
       }
     };
 
-    const onEvent = (e: StreamEvent) => {
-      switch (e.kind) {
-        case "started":
-          break;
-        case "connected":
-          set((s) =>
-            s.streaming
-              ? { streaming: { ...s.streaming, status: "connected" } }
-              : {},
-          );
-          addTimeline("Connected", "info");
-          break;
-        case "reasoning":
-          markStreaming();
-          pendingReasoning += e.delta;
-          schedule();
-          break;
-        case "content":
-          markStreaming();
-          pendingContent += e.delta;
-          schedule();
-          break;
-        case "tool_call":
-          set((s) =>
-            s.streaming
-              ? {
-                  streaming: {
-                    ...s.streaming,
-                    toolCalls: [
-                      ...s.streaming.toolCalls,
-                      { id: e.id, name: e.name, arguments: e.arguments },
-                    ],
-                  },
-                }
-              : {},
-          );
-          addTimeline(`Tool · ${e.name || "call"}`, "info");
-          break;
-        case "metrics":
-        case "done":
-          set((s) =>
-            s.streaming
-              ? {
-                  streaming: {
-                    ...s.streaming,
-                    metrics: { ...s.streaming.metrics, ...e.metrics },
-                  },
-                }
-              : {},
-          );
-          break;
-        case "error":
-          set((s) =>
-            s.streaming
-              ? { streaming: { ...s.streaming, status: "error", error: e.message } }
-              : {},
-          );
-          break;
-      }
-    };
-
-    try {
-      const result = await api.sendMessage(convId, text, model, onEvent);
-      if (frame != null) cancelAnimationFrame(frame);
-      set((s) => ({
-        messages: [
-          ...s.messages.filter((m) => m.id !== tempId),
-          result.user_message,
-          result.assistant_message,
-        ],
-        streaming: null,
-        conversations: bumpConversation(s.conversations, convId!),
-      }));
-    } catch (e) {
-      if (frame != null) cancelAnimationFrame(frame);
-      set((s) => ({
-        streaming: s.streaming
-          ? { ...s.streaming, status: "error", error: s.streaming.error ?? String(e) }
-          : null,
-      }));
-    }
+    await Promise.allSettled(runViews.map((r) => runOne(r.id, r.model)));
+    if (frame != null) cancelAnimationFrame(frame);
+    flush();
+    set((s) => ({
+      racing: false,
+      conversations: bump(s.conversations, convId as string),
+    }));
   },
 }));

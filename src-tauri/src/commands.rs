@@ -1,6 +1,10 @@
 //! Tauri commands — the typed bridge between the React UI and the backend.
+//!
+//! The unit of interaction is a *turn* (one prompt) carrying one or more
+//! *runs* (one model's streamed response). Racing N models = N concurrent
+//! `send_run` calls against the same turn.
 
-use crate::db::{Conversation, StoredMessage};
+use crate::db::{Conversation, Run, Turn, TurnWithRuns};
 use crate::error::{AppError, Result};
 use crate::llm::{ChatMessage, ChatRequest, LlmClient, Metrics, StreamEvent};
 use crate::AppState;
@@ -20,6 +24,13 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// One persisted raw SSE frame.
+#[derive(Serialize)]
+struct RawFrameRec {
+    at_ms: u64,
+    data: String,
+}
+
 /// User-facing settings, mirrored 1:1 by the TypeScript `Settings` type.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SettingsDto {
@@ -27,13 +38,6 @@ pub struct SettingsDto {
     pub api_key: String,
     pub default_model: String,
     pub theme: String,
-}
-
-/// Returned by `send_message` once the turn is persisted.
-#[derive(Debug, Serialize)]
-pub struct SendResult {
-    pub user_message: StoredMessage,
-    pub assistant_message: StoredMessage,
 }
 
 // ---- conversations ----
@@ -44,20 +48,15 @@ pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation
 }
 
 #[tauri::command]
-pub fn create_conversation(
-    state: State<'_, AppState>,
-    title: String,
-    model: String,
-) -> Result<Conversation> {
+pub fn create_conversation(state: State<'_, AppState>, title: String) -> Result<Conversation> {
     let now = now_ms();
     let conv = Conversation {
         id: new_id(),
         title: if title.trim().is_empty() {
-            "New chat".to_string()
+            "New session".to_string()
         } else {
             title
         },
-        model,
         created_at: now,
         updated_at: now,
     };
@@ -76,11 +75,28 @@ pub fn delete_conversation(state: State<'_, AppState>, id: String) -> Result<()>
 }
 
 #[tauri::command]
-pub fn get_messages(
+pub fn get_turns(
     state: State<'_, AppState>,
     conversation_id: String,
-) -> Result<Vec<StoredMessage>> {
-    state.db.list_messages(&conversation_id)
+) -> Result<Vec<TurnWithRuns>> {
+    state.db.get_turns_with_runs(&conversation_id)
+}
+
+/// Create a turn (one prompt). Runs are attached afterwards via `send_run`.
+#[tauri::command]
+pub fn create_turn(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    prompt: String,
+) -> Result<Turn> {
+    let turn = Turn {
+        id: new_id(),
+        conversation_id,
+        prompt,
+        created_at: now_ms(),
+    };
+    state.db.create_turn(&turn)?;
+    Ok(turn)
 }
 
 // ---- settings ----
@@ -121,46 +137,51 @@ pub async fn list_models(state: State<'_, AppState>) -> Result<Vec<String>> {
         .await
 }
 
-// ---- streaming chat ----
+// ---- streaming a run ----
 
-/// Send a user message and stream the assistant's reply.
+/// Stream one model's response to a turn.
 ///
-/// Every [`StreamEvent`] is pushed through `on_event` (a Tauri `Channel`,
-/// the lowest-overhead IPC primitive for high-frequency streaming). When the
-/// stream ends, both messages are persisted and returned.
+/// History is assembled from prior turns' primary (first-finished) run. Call
+/// this concurrently with several models on the same `turn_id` to race them —
+/// each call streams independently and persists its own run.
 #[tauri::command]
-pub async fn send_message(
+pub async fn send_run(
     state: State<'_, AppState>,
-    conversation_id: String,
-    text: String,
+    turn_id: String,
     model: String,
     on_event: Channel<StreamEvent>,
-) -> Result<SendResult> {
-    // 1. Persist the user's message.
-    let user_msg = StoredMessage {
-        id: new_id(),
-        conversation_id: conversation_id.clone(),
+) -> Result<Run> {
+    let turn = state
+        .db
+        .get_turn(&turn_id)?
+        .ok_or_else(|| AppError::Other("turn not found".to_string()))?;
+
+    // Assemble history from each prior turn's primary run.
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    for prior in state.db.list_turns(&turn.conversation_id)? {
+        if prior.id == turn.id || prior.created_at >= turn.created_at {
+            continue;
+        }
+        let runs = state.db.list_runs(&prior.id)?;
+        if let Some(primary) = runs
+            .iter()
+            .find(|r| r.status == "ok" && !r.content.is_empty())
+        {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: prior.prompt.clone(),
+            });
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: primary.content.clone(),
+            });
+        }
+    }
+    messages.push(ChatMessage {
         role: "user".to_string(),
-        content: text,
-        reasoning: None,
-        metrics: None,
-        created_at: now_ms(),
-    };
-    state.db.insert_message(&user_msg)?;
+        content: turn.prompt.clone(),
+    });
 
-    // 2. Assemble the prompt from the conversation history.
-    let history = state.db.list_messages(&conversation_id)?;
-    let messages: Vec<ChatMessage> = history
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .filter(|m| !m.content.is_empty())
-        .map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
-        })
-        .collect();
-
-    // 3. Build the provider client from saved settings.
     let base_url = state.db.get_setting("base_url")?.unwrap_or_default();
     let api_key = state.db.get_setting("api_key")?.unwrap_or_default();
     if api_key.trim().is_empty() {
@@ -176,17 +197,35 @@ pub async fn send_message(
         temperature: None,
     };
 
-    // 4. Stream the reply, accumulating final text + metrics as it flows.
+    // Stream, accumulating everything we need to persist the run.
     let mut content = String::new();
     let mut reasoning = String::new();
-    let mut final_metrics = Metrics::default();
+    let mut metrics = Metrics::default();
+    let mut raw: Vec<RawFrameRec> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut error: Option<String> = None;
     {
         let channel = on_event.clone();
         let collect = |event: StreamEvent| {
             match &event {
                 StreamEvent::Content { delta } => content.push_str(delta),
                 StreamEvent::Reasoning { delta } => reasoning.push_str(delta),
-                StreamEvent::Done { metrics, .. } => final_metrics = metrics.clone(),
+                StreamEvent::RawFrame { at_ms, data } => {
+                    if raw.len() < 200 {
+                        raw.push(RawFrameRec {
+                            at_ms: *at_ms,
+                            data: data.clone(),
+                        });
+                    }
+                }
+                StreamEvent::Done {
+                    metrics: m,
+                    finish_reason: fr,
+                } => {
+                    metrics = m.clone();
+                    finish_reason = fr.clone();
+                }
+                StreamEvent::Error { message } => error = Some(message.clone()),
                 _ => {}
             }
             let _ = channel.send(event);
@@ -195,34 +234,28 @@ pub async fn send_message(
             let _ = on_event.send(StreamEvent::Error {
                 message: e.to_string(),
             });
-            return Err(e);
+            error = Some(e.to_string());
         }
     }
 
-    // 5. Persist the assistant's reply.
-    let assistant_msg = StoredMessage {
+    let run = Run {
         id: new_id(),
-        conversation_id: conversation_id.clone(),
-        role: "assistant".to_string(),
+        turn_id,
+        model,
         content,
         reasoning: if reasoning.is_empty() {
             None
         } else {
             Some(reasoning)
         },
-        metrics: Some(serde_json::to_string(&final_metrics)?),
+        metrics: serde_json::to_string(&metrics).ok(),
+        raw: serde_json::to_string(&raw).ok(),
+        finish_reason,
+        status: (if error.is_some() { "error" } else { "ok" }).to_string(),
+        error,
         created_at: now_ms(),
     };
-    state.db.insert_message(&assistant_msg)?;
-    state.db.touch_conversation(&conversation_id, now_ms())?;
-    if !model.is_empty() {
-        state
-            .db
-            .update_conversation_model(&conversation_id, &model)?;
-    }
-
-    Ok(SendResult {
-        user_message: user_msg,
-        assistant_message: assistant_msg,
-    })
+    state.db.insert_run(&run)?;
+    state.db.touch_conversation(&turn.conversation_id, now_ms())?;
+    Ok(run)
 }

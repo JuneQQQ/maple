@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, RefreshCw, Search } from "lucide-react";
+import { Check, Plus, RefreshCw, Search, X } from "lucide-react";
 import clsx from "clsx";
 import { useAppStore } from "../store/appStore";
 
 const MAX_VISIBLE = 200;
 
-export function ModelPicker() {
+/** Selected-model chips + a picker. 2+ models means the next send is a race. */
+export function ModelBar() {
+  const selected = useAppStore((s) => s.selectedModels);
   const models = useAppStore((s) => s.models);
   const loading = useAppStore((s) => s.loadingModels);
-  const selected = useAppStore((s) => s.selectedModel);
-  const setModel = useAppStore((s) => s.setModel);
+  const toggleModel = useAppStore((s) => s.toggleModel);
   const refreshModels = useAppStore((s) => s.refreshModels);
 
   const [open, setOpen] = useState(false);
@@ -36,11 +37,30 @@ export function ModelPicker() {
   }, [models, query]);
 
   return (
-    <div className="model-picker" ref={ref}>
-      <button className="model-btn" onClick={() => setOpen((v) => !v)}>
-        <span className="model-name">{selected || "Select model"}</span>
-        <ChevronDown size={14} />
+    <div className="model-bar" ref={ref}>
+      {selected.map((m) => (
+        <span className="model-chip" key={m}>
+          <span className="model-chip-name" title={m}>
+            {m}
+          </span>
+          <button
+            className="model-chip-x"
+            title="Remove"
+            onClick={() => toggleModel(m)}
+          >
+            <X size={11} />
+          </button>
+        </span>
+      ))}
+
+      <button className="model-add" onClick={() => setOpen((o) => !o)}>
+        <Plus size={13} />
+        model
       </button>
+
+      {selected.length >= 2 && (
+        <span className="race-badge">⚡ race ×{selected.length}</span>
+      )}
 
       {open && (
         <div className="model-pop">
@@ -65,20 +85,19 @@ export function ModelPicker() {
             {!loading && filtered.length === 0 && (
               <div className="model-empty">No matching model.</div>
             )}
-            {filtered.map((m) => (
-              <button
-                key={m}
-                className={clsx("model-option", m === selected && "selected")}
-                onClick={() => {
-                  setModel(m);
-                  setOpen(false);
-                  setQuery("");
-                }}
-              >
-                <span className="model-option-name">{m}</span>
-                {m === selected && <Check size={14} />}
-              </button>
-            ))}
+            {filtered.map((m) => {
+              const on = selected.includes(m);
+              return (
+                <button
+                  key={m}
+                  className={clsx("model-option", on && "selected")}
+                  onClick={() => toggleModel(m)}
+                >
+                  <span className="model-option-name">{m}</span>
+                  {on && <Check size={14} />}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

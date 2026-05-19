@@ -3,17 +3,18 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
   Conversation,
-  StoredMessage,
-  SendResult,
+  Run,
   Settings,
   StreamEvent,
+  Turn,
+  TurnWithRuns,
 } from "./types";
 
 export const api = {
   listConversations: () => invoke<Conversation[]>("list_conversations"),
 
-  createConversation: (title: string, model: string) =>
-    invoke<Conversation>("create_conversation", { title, model }),
+  createConversation: (title: string) =>
+    invoke<Conversation>("create_conversation", { title }),
 
   renameConversation: (id: string, title: string) =>
     invoke<void>("rename_conversation", { id, title }),
@@ -21,8 +22,26 @@ export const api = {
   deleteConversation: (id: string) =>
     invoke<void>("delete_conversation", { id }),
 
-  getMessages: (conversationId: string) =>
-    invoke<StoredMessage[]>("get_messages", { conversationId }),
+  getTurns: (conversationId: string) =>
+    invoke<TurnWithRuns[]>("get_turns", { conversationId }),
+
+  createTurn: (conversationId: string, prompt: string) =>
+    invoke<Turn>("create_turn", { conversationId, prompt }),
+
+  /**
+   * Stream one model's response to a turn. `onEvent` fires for every backend
+   * StreamEvent; the promise resolves with the persisted run. Call several of
+   * these concurrently on one turn to race models.
+   */
+  sendRun: (
+    turnId: string,
+    model: string,
+    onEvent: (event: StreamEvent) => void,
+  ): Promise<Run> => {
+    const channel = new Channel<StreamEvent>();
+    channel.onmessage = onEvent;
+    return invoke<Run>("send_run", { turnId, model, onEvent: channel });
+  },
 
   getSettings: () => invoke<Settings>("get_settings"),
 
@@ -30,24 +49,4 @@ export const api = {
     invoke<void>("update_settings", { settings }),
 
   listModels: () => invoke<string[]>("list_models"),
-
-  /**
-   * Send a message and stream the reply. `onEvent` fires for every
-   * backend StreamEvent; the promise resolves once the turn is persisted.
-   */
-  sendMessage: (
-    conversationId: string,
-    text: string,
-    model: string,
-    onEvent: (event: StreamEvent) => void,
-  ): Promise<SendResult> => {
-    const channel = new Channel<StreamEvent>();
-    channel.onmessage = onEvent;
-    return invoke<SendResult>("send_message", {
-      conversationId,
-      text,
-      model,
-      onEvent: channel,
-    });
-  },
 };

@@ -1,28 +1,25 @@
 import { useRef, useState } from "react";
-import type { KeyboardEvent, ChangeEvent } from "react";
+import type { ChangeEvent, KeyboardEvent } from "react";
 import { Send } from "lucide-react";
 import { useAppStore } from "../store/appStore";
+import { ModelBar } from "./ModelBar";
 
 export function Composer() {
   const [text, setText] = useState("");
-  const sendMessage = useAppStore((s) => s.sendMessage);
-  const busy = useAppStore((s) => {
-    const st = s.streaming;
-    return st != null && st.status !== "done" && st.status !== "error";
-  });
+  const send = useAppStore((s) => s.send);
+  const racing = useAppStore((s) => s.racing);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   const submit = () => {
     const value = text.trim();
-    if (!value || busy) return;
+    if (!value || racing) return;
     setText("");
     if (taRef.current) taRef.current.style.height = "auto";
-    void sendMessage(value);
+    void send(value);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    // Enter sends; Shift+Enter is a newline. Ignore Enter while an IME
-    // composition is in progress (important for CJK input).
+    // Enter sends; Shift+Enter is a newline. Ignore Enter mid-IME-composition.
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
@@ -33,29 +30,32 @@ export function Composer() {
     setText(e.target.value);
     const el = e.target;
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 220) + "px";
+    el.style.height = Math.min(el.scrollHeight, 200) + "px";
   };
 
   return (
     <div className="composer">
-      <div className="composer-box">
-        <textarea
-          ref={taRef}
-          className="composer-input"
-          placeholder="Message Maple…   (Enter to send · Shift+Enter for newline)"
-          value={text}
-          onChange={onChange}
-          onKeyDown={onKeyDown}
-          rows={1}
-        />
-        <button
-          className="send-btn"
-          onClick={submit}
-          disabled={busy || text.trim().length === 0}
-          title={busy ? "Streaming…" : "Send"}
-        >
-          <Send size={16} />
-        </button>
+      <div className="composer-inner">
+        <ModelBar />
+        <div className="composer-box">
+          <textarea
+            ref={taRef}
+            className="composer-input"
+            placeholder="Ask anything — Enter to send, Shift+Enter for newline"
+            value={text}
+            onChange={onChange}
+            onKeyDown={onKeyDown}
+            rows={1}
+          />
+          <button
+            className="send-btn"
+            onClick={submit}
+            disabled={racing || text.trim().length === 0}
+            title={racing ? "Streaming…" : "Send"}
+          >
+            <Send size={16} />
+          </button>
+        </div>
       </div>
     </div>
   );

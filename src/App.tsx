@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { useAppStore } from "./store/appStore";
 import { TitleBar } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
-import { ChatView } from "./components/ChatView";
+import { ConversationView } from "./components/ConversationView";
 import { SettingsView } from "./components/SettingsView";
 
 export default function App() {
@@ -25,7 +25,7 @@ export default function App() {
           ) : view === "settings" ? (
             <SettingsView />
           ) : (
-            <ChatView />
+            <ConversationView />
           )}
         </main>
       </div>
